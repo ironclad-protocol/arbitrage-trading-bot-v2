@@ -1,8 +1,8 @@
 import { Wallet } from "ethers";
 import { Chain, SignatureTypeV2 } from "@polymarket/clob-client-v2";
 import {
-  POLYMARKET_FUNDER_ADDRESS,
-  POLYMARKET_PRIVATE_KEY,
+  FUNDER_ADDRESS,
+  PRIVATE_KEY,
   POLYMARKET_SIGNATURE_TYPE,
 } from "../config";
 
@@ -10,7 +10,7 @@ export const HOST = "https://clob.polymarket.com";
 export const CHAIN_ID = Chain.POLYGON;
 
 // Wrap ethers v6 Wallet so @polymarket/clob-client-v2 can use it.
-export const SIGNER = Object.assign(new Wallet(POLYMARKET_PRIVATE_KEY), {
+export const SIGNER = Object.assign(new Wallet(PRIVATE_KEY), {
   // clob-client-v2 expects _signTypedData (ethers v5-style); delegate to v6 signTypedData.
   _signTypedData(domain: any, types: any, value: any) {
     return (this as any).signTypedData(domain, types, value);
@@ -19,7 +19,7 @@ export const SIGNER = Object.assign(new Wallet(POLYMARKET_PRIVATE_KEY), {
 
 // For funded wallets (proxy/deposit), SIGNER is the EOA that signs and
 // FUNDER is the address that actually holds the funds.
-export const FUNDER = POLYMARKET_FUNDER_ADDRESS;
+export const FUNDER = FUNDER_ADDRESS;
 
 const SIGNATURE_TYPE_BY_NAME = {
   EOA: SignatureTypeV2.EOA,

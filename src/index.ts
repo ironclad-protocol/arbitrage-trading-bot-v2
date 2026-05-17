@@ -1,122 +1,221 @@
 import { ClobClient, SignatureTypeV2 } from "@polymarket/clob-client-v2";
-import chalk from "chalks-log";
+import logger from "chalks-log";
 import { generateMarketSlug } from "./config";
-import type { Coin, MarketConfig, Minutes } from "./types";
-import { CHAIN_ID, FUNDER, getMarket, getPrices, HOST, SIGNATURE_TYPE, SIGNER } from "./services";
-import { getCurrentTime } from "./utils";
 import { loadConfig } from "./config/toml";
+import type { Coin, MarketConfig, Minutes } from "./types";
+import {
+  CHAIN_ID,
+  FUNDER,
+  getMarket,
+  getPrices,
+  HOST,
+  SIGNATURE_TYPE,
+  SIGNER,
+} from "./services";
 import { Trade } from "./trade";
+import { PRICE_POLL_INTERVAL_MS } from "./trade/constants";
+import { getCurrentTime, sleep } from "./utils";
 
-loadConfig();
+const config = loadConfig();
 
 const marketConfig: MarketConfig = {
-  coin: globalThis.__CONFIG__.market.market_coin as Coin, // btc / eth / sol / xrp
-  minutes: parseInt(globalThis.__CONFIG__.market.market_period) as Minutes, // 15 / 60 / 240 / 1440
+  coin: config.market.market_coin as Coin,
+  minutes: Number.parseInt(config.market.market_period, 10) as Minutes,
 };
 
-async function main() {
-  const signerAddress = SIGNER?.address ?? "unknown";
+type ApiCredentials = Awaited<ReturnType<ClobClient["deriveApiKey"]>>;
+type ClobClientConfig = ConstructorParameters<typeof ClobClient>[0];
 
-  console.log(chalk.cyan("Starting Polymarket trade bot"));
-  console.log(chalk.gray(`Public key: ${signerAddress}`));
-  console.log(chalk.gray(`Strategy: ${globalThis.__CONFIG__.strategy} | Market: ${marketConfig.coin.toUpperCase()} ${marketConfig.minutes}m | Trade USD: $${globalThis.__CONFIG__.trade_usd}`));
-  console.log(chalk.gray("Trend legend: UP 🟢 | DOWN 🔴 | FLAT ⚪"));
-  console.log(chalk.gray("Position legend: UP 🟩 | DOWN 🟥 | NONE ⬛"));
-  const configuredSignatureType = process.env.POLYMARKET_SIGNATURE_TYPE?.trim();
-  const signatureCandidates = configuredSignatureType
-    ? [SIGNATURE_TYPE]
-    : [SignatureTypeV2.POLY_PROXY, SignatureTypeV2.EOA];
-
-  let apiKey: Awaited<ReturnType<ClobClient["createOrDeriveApiKey"]>> | null = null;
-  let activeSignatureType: SignatureTypeV2 = SIGNATURE_TYPE;
-  let lastAuthError: unknown = null;
-
-  for (const candidate of signatureCandidates) {
-    try {
-      const clientConfig: ConstructorParameters<typeof ClobClient>[0] = {
-        host: HOST,
-        chain: CHAIN_ID,
-        signer: SIGNER,
-        signatureType: candidate,
-      };
-      // For proxy/safe-style setups the funded wallet is required; for EOA it should be omitted.
-      if (candidate !== SignatureTypeV2.EOA) {
-        clientConfig.funderAddress = FUNDER;
-      }
-      const clobClient = new ClobClient(clientConfig);
-      try {
-        // Prefer derive first to avoid noisy 400 logs when a key already exists.
-        apiKey = await clobClient.deriveApiKey();
-      } catch {
-        apiKey = await clobClient.createApiKey();
-      }
-      activeSignatureType = candidate;
-      console.log(chalk.gray(`Authenticated CLOB with signature type: ${SignatureTypeV2[candidate]}`));
-      break;
-    } catch (error) {
-      lastAuthError = error;
-      console.warn(chalk.yellow(`Auth failed for signature type ${SignatureTypeV2[candidate]}, trying next...`));
-    }
-  }
-
-  if (!apiKey) {
-    throw new Error(
-      `Unable to create or derive CLOB API key for any supported signature type. Last error: ${String(lastAuthError)}`
-    );
-  }
-
-  while (true) {
-    const client = new ClobClient(
-      {
-        host: HOST,
-        chain: CHAIN_ID,
-        signer: SIGNER,
-        creds: apiKey, // Generated from L1 auth, API credentials enable L2 methods
-        signatureType: activeSignatureType,
-        ...(activeSignatureType !== SignatureTypeV2.EOA ? { funderAddress: FUNDER } : {}),
-      }
-    );
-    const { slug, endTimestamp } = generateMarketSlug(marketConfig.coin, marketConfig.minutes);
-
-    console.log(chalk.yellow(`Market selected: ${slug}`));
-    console.log(chalk.gray(`Window: ${getCurrentTime()} -> ${endTimestamp}`));
-
-    const market = await getMarket(slug);
-
-    const upTokenId = JSON.parse(market.clobTokenIds)[0];
-    const downTokenId = JSON.parse(market.clobTokenIds)[1];
-    const usd = globalThis.__CONFIG__.trade_usd;
-
-    const trade = new Trade
-      (
-        usd,
-        upTokenId,
-        downTokenId,
-        client
-      );
-
-    while (true) {
-
-      getPrices(upTokenId, downTokenId)
-        .then(async e => {
-
-          trade.updatePrices(endTimestamp - getCurrentTime(), e[upTokenId].BUY, e[upTokenId].SELL, e[downTokenId].BUY, e[downTokenId].SELL);
-          await trade.make_trading_decision();
-        })
-        .catch(e => console.error(chalk.red("Market loop error:"), e));
-
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-
-      if (endTimestamp - getCurrentTime() <= 0) {
-        break;
-      }
-    }
-  }
-
+interface AuthSession {
+  credentials: ApiCredentials;
+  signatureType: SignatureTypeV2;
 }
 
-main().catch(async (error) => {
-  console.error(chalk.red("Fatal startup error:"), error);
+interface OutcomeTokens {
+  upTokenId: string;
+  downTokenId: string;
+}
+
+let shuttingDown = false;
+
+function installShutdownHandlers(): void {
+  const onSignal = (signal: NodeJS.Signals): void => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    console.log(logger.yellow(`Received ${signal}, finishing current work then exiting...`));
+  };
+
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+}
+
+function formatUnknownError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function buildClobConfig(
+  signatureType: SignatureTypeV2,
+  credentials?: ApiCredentials,
+): ClobClientConfig {
+  const clobConfig: ClobClientConfig = {
+    host: HOST,
+    chain: CHAIN_ID,
+    signer: SIGNER,
+    signatureType,
+    ...(credentials ? { creds: credentials } : {}),
+  };
+
+  if (signatureType !== SignatureTypeV2.EOA) {
+    clobConfig.funderAddress = FUNDER;
+  }
+
+  return clobConfig;
+}
+
+function signatureTypeCandidates(): SignatureTypeV2[] {
+  const configured = process.env.POLYMARKET_SIGNATURE_TYPE?.trim();
+  return configured
+    ? [SIGNATURE_TYPE]
+    : [SignatureTypeV2.POLY_PROXY, SignatureTypeV2.EOA];
+}
+
+function printStartupBanner(signerAddress: string): void {
+  const { strategy, trade_usd: tradeUsd } = config;
+  const { coin, minutes } = marketConfig;
+
+  console.log(logger.cyan("Starting Polymarket trade bot"));
+  console.log(logger.gray(`Public key: ${signerAddress}`));
+  console.log(
+    logger.gray(
+      `Strategy: ${strategy} | Market: ${coin.toUpperCase()} ${minutes}m | Trade USD: $${tradeUsd}`,
+    ),
+  );
+  console.log(logger.gray("Trend legend: UP 🟢 | DOWN 🔴 | FLAT ⚪"));
+  console.log(logger.gray("Position legend: UP 🟩 | DOWN 🟥 | NONE ⬛"));
+}
+
+async function obtainApiCredentials(client: ClobClient): Promise<ApiCredentials> {
+  try {
+    return await client.deriveApiKey();
+  } catch {
+    return await client.createApiKey();
+  }
+}
+
+async function authenticateClob(): Promise<AuthSession> {
+  let lastAuthError: unknown;
+
+  for (const candidate of signatureTypeCandidates()) {
+    try {
+      const bootstrapClient = new ClobClient(buildClobConfig(candidate));
+      const credentials = await obtainApiCredentials(bootstrapClient);
+
+      console.log(
+        logger.gray(`Authenticated CLOB with signature type: ${SignatureTypeV2[candidate]}`),
+      );
+
+      return { credentials, signatureType: candidate };
+    } catch (error) {
+      lastAuthError = error;
+      console.warn(
+        logger.yellow(
+          `Auth failed for signature type ${SignatureTypeV2[candidate]}, trying next...`,
+        ),
+      );
+    }
+  }
+
+  throw new Error(
+    `Unable to create or derive CLOB API key. Last error: ${formatUnknownError(lastAuthError)}`,
+  );
+}
+
+function createTradingClient(session: AuthSession): ClobClient {
+  return new ClobClient(buildClobConfig(session.signatureType, session.credentials));
+}
+
+function parseOutcomeTokenIds(clobTokenIds: string): OutcomeTokens {
+  const ids: unknown = JSON.parse(clobTokenIds);
+
+  if (!Array.isArray(ids) || ids.length < 2) {
+    throw new Error("Market response does not include UP/DOWN clobTokenIds");
+  }
+
+  return { upTokenId: String(ids[0]), downTokenId: String(ids[1]) };
+}
+
+async function pollMarketOnce(
+  trade: Trade,
+  upTokenId: string,
+  downTokenId: string,
+  endTimestamp: number,
+): Promise<void> {
+  const quotes = await getPrices(upTokenId, downTokenId);
+  const now = getCurrentTime();
+  const up = quotes[upTokenId];
+  const down = quotes[downTokenId];
+
+  trade.updatePrices(
+    endTimestamp - now,
+    up.BUY,
+    up.SELL,
+    down.BUY,
+    down.SELL,
+  );
+
+  await trade.makeTradingDecision();
+}
+
+async function runMarketWindow(
+  client: ClobClient,
+  slug: string,
+  endTimestamp: number,
+): Promise<void> {
+  const market = await getMarket(slug);
+  const { upTokenId, downTokenId } = parseOutcomeTokenIds(market.clobTokenIds);
+  const trade = new Trade(config.trade_usd, upTokenId, downTokenId, client);
+
+  while (!shuttingDown && getCurrentTime() < endTimestamp) {
+    const loopStarted = Date.now();
+
+    try {
+      await pollMarketOnce(trade, upTokenId, downTokenId, endTimestamp);
+    } catch (error) {
+      console.error(logger.red("Market loop error:"), error);
+    }
+
+    const elapsed = Date.now() - loopStarted;
+    await sleep(Math.max(0, PRICE_POLL_INTERVAL_MS - elapsed));
+  }
+}
+
+async function main(): Promise<void> {
+  installShutdownHandlers();
+
+  const signerAddress = SIGNER?.address ?? "unknown";
+  printStartupBanner(signerAddress);
+
+  const session = await authenticateClob();
+  const client = createTradingClient(session);
+
+  while (!shuttingDown) {
+    const { slug, endTimestamp } = generateMarketSlug(marketConfig.coin, marketConfig.minutes);
+
+    console.log(logger.yellow(`Market selected: ${slug}`));
+    console.log(logger.gray(`Window: ${getCurrentTime()} -> ${endTimestamp}`));
+
+    await runMarketWindow(client, slug, endTimestamp);
+  }
+
+  console.log(logger.gray("Shutdown complete."));
+}
+
+main().catch((error: unknown) => {
+  console.error(logger.red("Fatal startup error:"), error);
   process.exit(1);
 });

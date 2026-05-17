@@ -1,8 +1,8 @@
 import "dotenv/config";
 
-export const POLYMARKET_PRIVATE_KEY = reteriveDotEnv("POLYMARKET_PRIVATE_KEY");
-export const POLYMARKET_FUNDER_ADDRESS = reteriveDotEnv(
-    "POLYMARKET_FUNDER_ADDRESS",
+export const PRIVATE_KEY = reteriveDotEnv("PRIVATE_KEY");
+export const FUNDER_ADDRESS = reteriveDotEnv(
+    "FUNDER_ADDRESS",
     "PROXY_WALLET_ADDRESS"
 );
 export const POLYMARKET_SIGNATURE_TYPE = process.env.POLYMARKET_SIGNATURE_TYPE;
