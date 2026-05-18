@@ -1,37 +1,52 @@
 {
-  "name": "Arbitrage Trading Bot",
-  "version": "1.0.0",
-  "type": "commonjs",
-  "description": "Automated trading bot",
-  "main": "index.js",
-  "engines": {
-    "node": ">=20.6.0"
-  },
+  "name": "Solana Copy Trading Bot",
+  "author": "EdmonkLabs",
   "scripts": {
-    "dev": "tsx src/index.ts",
-    "build": "tsc",
     "start": "node dist/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "rimraf dist && tsc",
+    "yellow": "ts-node test.ts",
+    "vibe": "ts-node-dev test.ts",
+    "dev": "tsx watch src/index.ts",
+    "sell": "ts-node sell.ts"
   },
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "@iarna/toml": "^2.2.5",
-    "@polymarket/clob-client-v2": "^1.0.3",
-    "@tensorflow/tfjs": "^4.22.0",
+    "@coral-xyz/anchor": "^0.30.1",
+    "@coral-xyz/borsh": "^0.30.1",
+    "@metaplex-foundation/js": "^0.20.1",
+    "@metaplex-foundation/mpl-token-metadata": "^3.2.1",
+    "@raydium-io/raydium-sdk": "^1.3.1-beta.58",
+    "@serejke/solana-jupiter-swap-parser": "^1.4.0",
+    "@shyft-to/js": "^0.2.40",
+    "@solana/spl-token": "^0.4.6",
+    "@solana/web3.js": "^1.89.1",
+    "@triton-one/yellowstone-grpc": "^1.0.0",
+    "@types/express": "^4.17.21",
+    "axios": "^1.7.9",
+    "body-parser": "^1.20.2",
+    "bs58": "^6.0.0",
     "chalks-log": "^1.6.0",
-    "@types/ws": "^8.18.1",
-    "ccxt": "^4.5.36",
+    "cors": "^2.8.5",
+    "decimal.js": "^10.4.3",
     "dotenv": "^16.4.5",
-    "ethers": "^6.16.0",
-    "ws": "^8.19.0",
-    "zod": "^4.3.5"
+    "express": "^4.19.2",
+    "got": "^14.4.5",
+    "jito-ts": "^4.1.2",
+    "mongoose": "^8.4.5",
+    "node-telegram-bot-api": "^0.63.0",
+    "nodemon": "^3.1.4",
+    "readline": "^1.3.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "undici": "^7.1.1",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@types/dotenv": "^8.2.3",
-    "@types/node": "^20.11.0",
-    "ts-node": "^10.9.2",
-    "tsx": "^4.7.0",
-    "typescript": "^5.3.3"
+    "@types/bn.js": "^5.1.6",
+    "@types/cors": "^2.8.17",
+    "@types/mongoose": "^5.11.97",
+    "@types/node-telegram-bot-api": "^0.64.7",
+    "glob": "^11.0.1",
+    "rimraf": "^6.0.1",
+    "tsx": "^4.20.6"
   }
 }

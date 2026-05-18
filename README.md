@@ -1,59 +1,92 @@
-# Arbitrage Trading Bot V2
+# Solana Copy Trading Bot (TypeScript)
 
-**Languages:** [English](README.md) · [Русский](README.ru.md) · [中文](README.zh-CN.md)
+TypeScript copy-trading stack built for **speed**: stream a leader wallet’s swaps as early as your Geyser feed allows, build a follow-on transaction with aggressive compute settings, and land it through **private / MEV-aware submission rails** instead of only a slow public `sendRawTransaction` path.
 
----
+## Fast 0→1 block copy trading
 
-TypeScript bot for binary crypto markets (UP/DOWN). Resolves the active market from `trade.toml`, polls CLOB prices, runs `trade_1` or `trade_2`, and executes FAK orders via a Gnosis Safe proxy wallet on Polygon.
+The goal is to **minimize slots between “they traded” and “we’re in the same neighborhood of the ledger.”** In practice that means:
 
-**Flow:** `trade.toml` + `.env` → Zod config → strategy engine → CLOB client (signer + funder) → Gamma (slug), CLOB `/prices`, on-chain balances.
+- **Low-latency observation** — Helius Atlas-style `transactionSubscribe` on the wallets you mirror (`src/stream/helius-geyser.ts`), so you react from full transaction payloads rather than polling.
+- **Fast path to inclusion** — Swaps are wired to a **transaction landing layer** under `utils/tx-submitters/`: the same class of infra traders use to chase **next-block** or **0–1 slot** inclusion after a signal (tips + direct paths to validators / relays).
 
-## Strategies
+### Multi-engine landing (Jito, NextBlock, Helius Sender, Astralane, Zeroslot)
 
-Set `strategy` to `"trade_1"` or `"trade_2"`. Shared signals:
+This repo integrates **multiple high-speed submitters** so you are not locked to one RPC:
 
-| Signal | Meaning |
-| --- | --- |
-| `remaining_time_ratio` | `0` at window open → `1` at close |
-| `up_price_ratio` | `0` when UP ≈ $0.50 → `1` when UP ≈ $0 or $1 |
+| Engine | Role |
+|--------|------|
+| **Jito** | Block-engine **bundles** + dedicated tip accounts (`utils/tx-submitters/jito.ts`, `sendBundleTxUsingJito`). |
+| **NextBlock** | Relay submission with fee / tip flow (`utils/tx-submitters/nextblock.ts`). |
+| **Helius Sender** | Helius “fast” sender path with tip requirements (`utils/tx-submitters/helius-sender.ts`). |
+| **Astralane** | Iris gateway + API key + tip lamports (`utils/tx-submitters/astralane.ts`). |
+| **Zeroslot** | Staked-conn style endpoint + API key (`utils/tx-submitters/zeroslot.ts`). |
 
-**`trade_1` (exit-only)** — Sells the held side when `remaining_time_ratio > exit_time_ratio` **or** `up_price_ratio > exit_price_ratio`. No entries.
+Shared **tip instruction** helpers live in `utils/tx-submitters/tips.ts`. Instruction-based flows can go through `submitAndConfirm` / `submitWithConfiguredSubmitter` in `utils/tx-submitters/dispatch.ts`, which switches on `TX_SUBMITTER`. **Jito** uses the bundle API separately (see dispatch comments). Some `*ByRacing` swap helpers call Jito bundles directly—check the DEX module you use.
 
-**`trade_2`** — **Entry:** once per market, no position, time/price gates met → buy higher-priced side. **Exit:** sell when `up_price_ratio` in `exit_price_ratio_range`. **Emergency swap:** after exit, buy opposite side if `up_price_ratio` in `emergency_swap_price`.
+**Operating for maximum speed:** set `TX_SUBMITTER` to the provider that fits your region, tip budget, and success rate, tune `CU_PRICE` / slippage in `src/core/config.ts` and `config/index.ts`, and fund tips per provider docs. **Going further:** you can **race** the same signed transaction (or parallel builds) across several of these backends—for example by firing `submitSignedTxHeliusSender`, Astralane, Zeroslot, and NextBlock in a `Promise.race` or controlled multi-submit wrapper—so the first successful landing wins; that pattern is a small extension on top of the existing clients.
 
-> `trade_1` still requires unused schema fields (`entry_price_range`, `swap_price_range`, `take_profit`, `stop_loss`) in `trade.toml` for validation.
+## How it works
+
+1. **`copyWallets.json`** — Object whose **keys** are base58 wallet addresses to mirror (values can be anything). This file is gitignored; create it at the repo root.
+2. **`src/stream/helius-geyser.ts`** — Subscribes to successful transactions that touch any of those accounts.
+3. **`src/parsers/router.ts`** — Detects DEX program IDs and parses txs into `CopyTradeEvent` (`src/core/types.ts`). Trades that go through Jupiter, OKX, or DFlow aggregators are **ignored** so the bot does not chase routed bundles blindly.
+4. **`src/queue/trade-queue.ts`** — Queues events; **`src/executors/copy-executor.ts`** runs the actual buys/sells.
+
+**Supported venues (parsing):** Pump.fun, PumpSwap (pAMM), Raydium AMM. Raydium CPMM helpers exist under `dex/raydium/` but are not wired in the router’s main branch.
+
+**Copy execution today:** `copy-executor.ts` only executes **PumpSwap** (`buyPumpAmmTokenByRacing` / `sellPumpAmmTokenByRacing`). Pump.fun and Raydium AMM branches are present but **commented out**; uncomment and test before relying on them.
+
+**Note:** `src/index.ts` currently includes a **direct `buyPumpAmmTokenByRacing` test call** before the stream starts. Remove or guard that if you only want the Geyser → copy pipeline.
 
 ## Requirements
 
-- Node.js `>= 20.6.0`
-- `PRIVATE_KEY` (EOA signer), `FUNDER_ADDRESS` or `PROXY_WALLET_ADDRESS` (Gnosis Safe with USDC on Polygon, chain `137`)
+- Node.js (LTS recommended)
+- A **mainnet RPC** URL and a **Helius Geyser / Atlas** WebSocket URL that supports `transactionSubscribe` with `accountInclude` (see `.env.example`)
+- Funded signer keypair for the bot
 
-## Quick start
+## Setup
 
 ```bash
 npm install
-cp .env.example .env   # set PRIVATE_KEY, FUNDER_ADDRESS
-# edit trade.toml: strategy, trade_usd, [market] coin + period
-npm run dev            # or: npm run build && npm start
+cp .env.example .env
+# Edit .env: PRIVATE_KEY, RPC_MAINNET_URL, HELIUS_GEYSER_URL
 ```
 
-| `trade.toml` | Values |
-| --- | --- |
-| `strategy` | `trade_1` \| `trade_2` |
-| `trade_usd` | USD per entry |
-| `[market].market_coin` | `btc` \| `eth` \| `sol` \| `xrp` |
-| `[market].market_period` | `5` \| `15` \| `60` \| `240` \| `1440` (minutes) |
+Create `copyWallets.json` at the project root, for example:
 
-5-minute windows: **BTC only**. ETH/SOL/XRP: `15`, `60`, `240`, `1440`.
+```json
+{
+  "SoMeWaLlEt1111111111111111111111111111111111": true
+}
+```
 
-## Logs
+## Configuration
 
-~every 3s: market line (`tMinus`, prices, `upRatio`, `timeRatio`, `trend`, `position`, `engine`) and portfolio line (`cash`, `shares`, `total`, …). `trend`: UP/DOWN/FLAT; `position`: UP/DOWN/NONE; `engine`: BUSY (order in flight) / IDLE.
+| Source | Purpose |
+|--------|---------|
+| `.env` | Keys, RPC, Geyser URL, optional `SIMULATION_MODE`, `TX_SUBMITTER`, tip URLs/amounts (see `.env.example`) |
+| `config/index.ts` | Slippage, `COPY_PERCENT`, `Copy_Buy_FixedAmount`, `TX_SUBMITTER`, connection defaults, Jito/NextBlock/etc. constants |
+| `src/core/config.ts` | Program IDs, optional env-based `COPY_PERCENT` / `COPY_FIXED_SOL` (executor currently reads `config/index.ts`) |
 
-## Security
+**Transaction landing:** default selection is `TX_SUBMITTER` in `.env` (`jito` | `nextblock` | `helius-sender` | `astralane` | `zeroslot`). Non-Jito values route through `submitAndConfirm` in `utils/tx-submitters/dispatch.ts`. Jito bundle sends use the Jito helpers directly. Env knobs for tips and endpoints are documented in `.env.example`.
 
-Do not commit `.env` or keys. Use a dedicated signer and lightly funded proxy. Start with low `trade_usd` ($1–$3). Orders use Gnosis Safe signature type (`SIGNATURE_TYPE = 2`); funder needs USDC and approvals. No profit guarantee — full loss risk.
+## Scripts
 
-## License
+| Command | Description |
+|---------|-------------|
+| `npm run build` | Compile TypeScript to `dist/` |
+| `npm start` | Run `node dist/index.js` (build first) |
+| `npm run dev` | Run `src/index.ts` with `ts-node-dev` |
+| `npm run sell` | Interactive menu to manually sell from `tradedTokens.json` (Pump.fun racing sell) |
+| `npm run yellow` / `npm run vibe` | Run `test.ts` (Yellowstone gRPC sample / experiments) |
 
-ISC — see `package.json`.
+## Project layout (high level)
+
+- `src/` — Entry (`index.ts`), Geyser client, parsers, queue, copy executor, types
+- `dex/` — Pump.fun, PumpSwap, Raydium, Jupiter swap and parse logic
+- `config/` — Shared runtime config and Anchor programs (e.g. PumpSwap IDL)
+- `utils/` — JSON helpers, holdings, tx submitters, parsers
+
+## Disclaimer
+
+Copy trading is high risk (slippage, MEV, failed txs, and total loss of funds). This repository is provided as-is; audit behavior and costs before using real money.
